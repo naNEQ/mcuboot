@@ -414,6 +414,7 @@ class Image:
                 msg = "Image size (0x{:x}) + trailer (0x{:x}) exceeds " \
                       "requested size 0x{:x}".format(
                           len(self.payload), tsize, self.slot_size)
+                print("ERROR - " + msg)
                 raise click.UsageError(msg)
 
     def ecies_hkdf(self, enckey, plainkey):

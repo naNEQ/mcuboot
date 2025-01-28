@@ -1,4 +1,4 @@
-#! /usr/bin/env python3
+    #! /usr/bin/env python3
 #
 # Copyright 2017-2020 Linaro Limited
 # Copyright 2019-2023 Arm Limited
@@ -17,6 +17,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import httpx
+import os
+from datetime import datetime
+from dateutil import parser
+import pytz
 import re
 import click
 import getpass
@@ -44,6 +49,120 @@ MIN_PYTHON_VERSION = (3, 6)
 if sys.version_info < MIN_PYTHON_VERSION:
     sys.exit("Python %s.%s or newer is required by imgtool."
              % MIN_PYTHON_VERSION)
+
+
+class ExternalSigningService:
+
+    def __init__(self, oper_id, key_id='key1'):
+        self.oper_id = oper_id
+        self.key_id = key_id
+
+    def calculate_elapsed_time(self, date_string):
+        """
+        Calculate elapsed time from a given ISO format date string to now.
+        
+        Args:
+            date_string: ISO format datetime string (e.g., '2024-12-21T20:18:39.908959Z')
+        
+        Returns:
+            dict: Elapsed time in different units
+        """
+        # Parse the input date string
+        start_date = parser.parse(date_string)
+        
+        # Get current time in UTC
+        current_time = datetime.now(pytz.UTC)
+        
+        # Calculate the time difference
+        time_diff = current_time - start_date
+        
+        # Calculate different units
+        total_seconds = time_diff.total_seconds()
+        
+        return {
+            'days': time_diff.days,
+            'hours': int(total_seconds // 3600),
+            'minutes': int((total_seconds % 3600) // 60),
+            'seconds': int(total_seconds % 60),
+            'total_seconds': total_seconds
+        }
+    
+    def sign_digest(self, digest):
+        if not self.oper_id:
+            print("ERROR: No operation id available, will shut down")
+            sys.exit(1)
+        
+        """Send digest to external signing service and get signature"""
+        url_post_access_token = "https://authserver.forest-comet.cryptera.com:8300/oauth2/token"
+        data_post_access_token = {'grant_type': 'client_credentials'}
+        headers_post_access_token = {'Authorization': 'Basic YWRtaW5jbGllbnQ6cGFzc3dvcmQ='}
+
+        url_signorders = 'https://keyserver.forest-comet.cryptera.com:8200/api/signorders'
+        
+        print("Initiating contact and authentication to the KeyServer")
+
+        r = httpx.post(url_post_access_token, headers=headers_post_access_token, data=data_post_access_token)
+
+        if r.status_code == 200:
+            r_json = r.json()
+            access_token = r_json['access_token']
+            print("Authentication successful")
+        else:
+            print("ERROR: Authentication failed")
+            sys.exit(1)
+
+        headers_get_keys = {'Authorization': f'Bearer {access_token}', 'accept': 'application/json', 'Content-Type': 'application/json'}
+
+        print(f"Operation id: {self.oper_id}. Will validate if it can still be used.")
+        url_get_operation_info = f"https://keyserver.forest-comet.cryptera.com:8200/api/operations/{self.oper_id}"
+        r = httpx.get(url_get_operation_info, headers=headers_get_keys)
+        
+        if r.status_code != 200:
+            print("\nERROR: Failed to get information about operation")
+            sys.exit(1)
+        
+        r_json = r.json()
+
+        if not r_json['approved']:
+            print("ERROR: Pipeline not approved, can't sign")
+            sys.exit(1)
+
+        if r_json['keyusagerestrictions'][0]['usagecount'] >= r_json['keyusagerestrictions'][0]['maxusagecount']:
+            print("ERROR: No more available key usages for the pipeline")
+            sys.exit(1)
+
+        elapsed = self.calculate_elapsed_time(r_json['createddate'])
+        print(f"Seconds elapsed since pipeline creation: {elapsed['total_seconds']:.2f}")
+        if elapsed['total_seconds'] > int(r_json['validms'] // 1000):
+            print("ERROR: The pipeline has expired!")
+            sys.exit(1)
+
+        print("Pipeline is valid! We can now proceed to signing!")
+
+        headers_signorders = {'Authorization': f'Bearer {access_token}', 'accept': 'application/json', 'Content-Type': 'application/json'}
+
+        data_signorder = {
+            'operationid': self.oper_id,
+            'keyid': self.key_id,
+            'inputdata': digest.hex(),
+            'inputformat': 'hex',
+            'signatureformat': 'asn1',
+            'description': "Signing a digest from a Zephyr image, HVAC IoT project"
+        }
+
+        r = httpx.post(url_signorders, headers=headers_signorders, json=data_signorder)
+        r_json = r.json()
+        print(r_json)
+
+        if r.status_code == 201:
+            print("Sign order created successfully")
+            signature = r_json['result']
+            print(f"Signature: {signature}")
+        else:
+            print("Error creating sign order")
+            sys.exit(1)
+        
+        return signature
 
 
 def gen_rsa2048(keyfile, passwd):
@@ -421,6 +540,9 @@ class BasedIntParamType(click.ParamType):
 @click.option('--fix-sig', metavar='filename',
               help='fixed signature for the image. It will be used instead of '
               'the signature calculated using the public key')
+@click.option('--fix-sig-out', metavar='filename',
+              help='Path to the file to which the signature for the image'
+              'as received from Cryptera (in hex formatted string) will be written.')
 @click.option('--fix-sig-pubkey', metavar='filename',
               help='public key relevant to fixed signature')
 @click.option('--sig-out', metavar='filename',
@@ -433,6 +555,10 @@ class BasedIntParamType(click.ParamType):
               help='send to OUTFILE the payload or payload''s digest instead '
               'of complied image. These data can be used for external image '
               'signing')
+@click.option('--signing-operation-id',
+              help='Operation ID for the Cryptera signing service')
+@click.option('--signing-key-id',
+              help='Key ID for the Cryptera signing service')
 @click.command(help='''Create a signed or unsigned image\n
                INFILE and OUTFILE are parsed as Intel HEX if the params have
                .hex extension, otherwise binary format is used''')
@@ -441,8 +567,9 @@ def sign(key, public_key_format, align, version, pad_sig, header_size,
          endian, encrypt_keylen, encrypt, compression, infile, outfile,
          dependencies, load_addr, hex_addr, erased_val, save_enctlv,
          security_counter, boot_record, custom_tlv, rom_fixed, max_align,
-         clear, fix_sig, fix_sig_pubkey, sig_out, user_sha, vector_to_sign,
-         non_bootable):
+         clear, fix_sig, fix_sig_out, fix_sig_pubkey, sig_out, user_sha,
+         vector_to_sign, non_bootable, signing_operation_id,
+         signing_key_id):
 
     if confirm:
         # Confirmed but non-padded images don't make much sense, because
@@ -492,18 +619,54 @@ def sign(key, public_key_format, align, version, pad_sig, header_size,
         else:
             custom_tlvs[tag] = value.encode('utf-8')
 
-    # Allow signature calculated externally.
-    raw_signature = load_signature(fix_sig) if fix_sig else None
+    ext_sig = None
+    
+    # Sign the image externally using Cryptera API if no key and no fix_sig is provided
+    if key is None and fix_sig is None:
+        # Initialize signing service
+        signer = ExternalSigningService(signing_operation_id, signing_key_id)
+
+        # Step 1: Get the digest
+        img.create(
+            key=None,  # This is not used for digest calculation
+            enckey=None,  # This is not used for digest calculation
+            public_key_format=public_key_format,
+            vector_to_sign='digest'  # This exports just the digest
+        )
+        digest = img.payload
+        print(f"Digest: {digest.hex()}")
+
+        # Reload the image, because the payload was replaced with the digest at this point
+        img.load(infile)
+
+        # Step 2: Get signature from external service
+        ext_sig = signer.sign_digest(digest)
+
+        if fix_sig_out is not None:
+            with open(fix_sig_out, 'wb') as file:
+                file.write(base64.b64encode(bytes.fromhex(ext_sig)))
+
+    if ext_sig:
+        raw_signature = bytes.fromhex(ext_sig)
+        print(f"Signature received from Cryptera (in bytes): {raw_signature}")
+    elif fix_sig:
+        # Allow signature calculated externally.
+        raw_signature = load_signature(fix_sig)
+    else:
+        raw_signature = None
 
     baked_signature = None
     pub_key = None
 
     if raw_signature is not None:
         if fix_sig_pubkey is None:
+            print("Public key of the fixed signature is not specified")
             raise click.UsageError(
                 'public key of the fixed signature is not specified')
 
+        print("Loading public key corresponding to the fixed signature")
         pub_key = load_key(fix_sig_pubkey)
+        print("Public key loaded")
 
         baked_signature = {
             'value': raw_signature
@@ -557,7 +720,36 @@ def sign(key, public_key_format, align, version, pad_sig, header_size,
     img.save(outfile, hex_addr)
     if sig_out is not None:
         new_signature = img.get_signature()
+        print(os.path.basename(__file__) + f": sig from image: {new_signature}")
         save_signature(sig_out, new_signature)
+
+    verif_key = None
+    
+    # Check that signed image can be verified by given key
+    if key:
+        verif_key = key
+    elif pub_key:
+        verif_key = pub_key
+
+    if verif_key is not None:
+        print("Verifying the signed image...")
+        ret, version, digest = image.Image.verify(outfile, verif_key)
+        if ret == image.VerifyResult.OK:
+            print("Image was correctly validated")
+            print("Image version: {}.{}.{}+{}".format(*version))
+            print("Image digest: {}".format(digest.hex()))
+            return
+        elif ret == image.VerifyResult.INVALID_MAGIC:
+            print("Invalid image magic; is this an MCUboot image?")
+        elif ret == image.VerifyResult.INVALID_TLV_INFO_MAGIC:
+            print("Invalid TLV info magic; is this an MCUboot image?")
+        elif ret == image.VerifyResult.INVALID_HASH:
+            print("Image has an invalid hash")
+        elif ret == image.VerifyResult.INVALID_SIGNATURE:
+            print("The signature doesn't match the given key")
+        else:
+            print("Unknown return code: {}".format(ret))
+        sys.exit(1)
 
 
 class AliasesGroup(click.Group):
