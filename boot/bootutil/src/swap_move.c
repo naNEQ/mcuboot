@@ -86,7 +86,7 @@ boot_read_image_header(struct boot_loader_state *state, int slot,
 
     off = 0;
     if (bs && !boot_status_is_reset(bs)) {
-	boot_find_status(BOOT_CURR_IMG(state), &fap);
+        boot_find_status(BOOT_CURR_IMG(state), &fap);
         if (fap == NULL || boot_read_swap_size(fap, &swap_size)) {
             rc = BOOT_EFLASH;
             goto done;
@@ -234,6 +234,28 @@ boot_status_internal_off(const struct boot_status *bs, int elem_sz)
     return off;
 }
 
+static int app_max_sectors(struct boot_loader_state *state)
+{
+    uint32_t sz = 0;
+    uint32_t sector_sz;
+    uint32_t trailer_sz;
+    uint32_t first_trailer_idx;
+
+    sector_sz = boot_img_sector_size(state, BOOT_PRIMARY_SLOT, 0);
+    trailer_sz = boot_trailer_sz(BOOT_WRITE_SZ(state));
+    first_trailer_idx = boot_img_num_sectors(state, BOOT_PRIMARY_SLOT) - 1;
+
+    while (1) {
+        sz += sector_sz;
+        if  (sz >= trailer_sz) {
+            break;
+        }
+        first_trailer_idx--;
+    }
+
+    return first_trailer_idx;
+}
+
 int
 boot_slots_compatible(struct boot_loader_state *state)
 {
@@ -242,18 +264,29 @@ boot_slots_compatible(struct boot_loader_state *state)
     size_t sector_sz_pri = 0;
     size_t sector_sz_sec = 0;
     size_t i;
+    size_t num_usable_sectors_pri;
 
     num_sectors_pri = boot_img_num_sectors(state, BOOT_PRIMARY_SLOT);
     num_sectors_sec = boot_img_num_sectors(state, BOOT_SECONDARY_SLOT);
+    num_usable_sectors_pri = app_max_sectors(state);
+
     if ((num_sectors_pri != num_sectors_sec) &&
-            (num_sectors_pri != (num_sectors_sec + 1))) {
+            (num_sectors_pri != (num_sectors_sec + 1)) &&
+            (num_usable_sectors_pri != (num_sectors_sec + 1))) {
         BOOT_LOG_WRN("Cannot upgrade: not a compatible amount of sectors");
+        BOOT_LOG_DBG("slot0 sectors: %d, slot1 sectors: %d, usable slot0 sectors: %d",
+                     (int)num_sectors_pri, (int)num_sectors_sec,
+                     (int)(num_usable_sectors_pri - 1));
+        return 0;
+    } else if (num_sectors_pri > BOOT_MAX_IMG_SECTORS) {
+        BOOT_LOG_WRN("Cannot upgrade: more sectors than allowed");
         return 0;
     }
 
-    if (num_sectors_pri > BOOT_MAX_IMG_SECTORS) {
-        BOOT_LOG_WRN("Cannot upgrade: more sectors than allowed");
-        return 0;
+    if (num_usable_sectors_pri != (num_sectors_sec + 1)) {
+        BOOT_LOG_DBG("Non-optimal sector distribution, slot0 has %d usable sectors (%d assigned) "
+                     "but slot1 has %d assigned", (int)(num_usable_sectors_pri - 1),
+                     (int)num_sectors_pri, (int)num_sectors_sec);
     }
 
     for (i = 0; i < num_sectors_sec; i++) {
@@ -264,6 +297,26 @@ boot_slots_compatible(struct boot_loader_state *state)
             return 0;
         }
     }
+
+#ifdef MCUBOOT_SLOT0_EXPECTED_ERASE_SIZE
+    if (sector_sz_pri != MCUBOOT_SLOT0_EXPECTED_ERASE_SIZE) {
+        BOOT_LOG_DBG("Discrepancy, slot0 expected erase size: %d, actual: %d",
+                     MCUBOOT_SLOT0_EXPECTED_ERASE_SIZE, sector_sz_pri);
+    }
+#endif
+#ifdef MCUBOOT_SLOT1_EXPECTED_ERASE_SIZE
+    if (sector_sz_sec != MCUBOOT_SLOT1_EXPECTED_ERASE_SIZE) {
+        BOOT_LOG_DBG("Discrepancy, slot1 expected erase size: %d, actual: %d",
+                     MCUBOOT_SLOT1_EXPECTED_ERASE_SIZE, sector_sz_sec);
+    }
+#endif
+
+#if defined(MCUBOOT_SLOT0_EXPECTED_WRITE_SIZE) || defined(MCUBOOT_SLOT1_EXPECTED_WRITE_SIZE)
+    if (!swap_write_block_size_check(state)) {
+        BOOT_LOG_WRN("Cannot upgrade: slot write sizes are not compatible");
+        return 0;
+    }
+#endif
 
     if (num_sectors_pri > num_sectors_sec) {
         if (sector_sz_pri != boot_img_sector_size(state, BOOT_PRIMARY_SLOT, i)) {
@@ -544,24 +597,19 @@ swap_run(struct boot_loader_state *state, struct boot_status *bs,
 
 int app_max_size(struct boot_loader_state *state)
 {
-    uint32_t sz = 0;
-    uint32_t sector_sz;
-    uint32_t trailer_sz;
-    uint32_t first_trailer_idx;
+    uint32_t sector_sz_primary;
+    uint32_t sector_sz_secondary;
+    uint32_t sz_primary;
+    uint32_t sz_secondary;
 
-    sector_sz = boot_img_sector_size(state, BOOT_PRIMARY_SLOT, 0);
-    trailer_sz = boot_trailer_sz(BOOT_WRITE_SZ(state));
-    first_trailer_idx = boot_img_num_sectors(state, BOOT_PRIMARY_SLOT) - 1;
+    sector_sz_primary = boot_img_sector_size(state, BOOT_PRIMARY_SLOT, 0);
+    sector_sz_secondary = boot_img_sector_size(state, BOOT_SECONDARY_SLOT, 0);
 
-    while (1) {
-        sz += sector_sz;
-        if  (sz >= trailer_sz) {
-            break;
-        }
-        first_trailer_idx--;
-    }
+    /* Account for image flags and move sector */
+    sz_primary = app_max_sectors(state) * sector_sz_primary - sector_sz_primary;
+    sz_secondary = boot_img_num_sectors(state, BOOT_SECONDARY_SLOT) * sector_sz_secondary;
 
-    return (first_trailer_idx * sector_sz);
+    return (sz_primary <= sz_secondary ? sz_primary : sz_secondary);
 }
 
 #endif
