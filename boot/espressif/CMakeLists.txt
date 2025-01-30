@@ -387,29 +387,35 @@ add_custom_command(TARGET ${APP_EXECUTABLE} POST_BUILD
     COMMAND
     ${esptool_path}
     --chip ${MCUBOOT_TARGET} elf2image --min-rev ${ESP_MIN_REVISION}
-    --flash_mode ${ESP_FLASH_MODE} --flash_freq ${ESP_FLASH_FREQ} --flash_size ${CONFIG_ESP_FLASH_SIZE}
+    --flash_mode ${ESP_FLASH_MODE} --flash_freq ${ESP_FLASH_FREQ} --flash_size
+    ${CONFIG_ESP_FLASH_SIZE}
     -o ${APP_NAME}.bin ${APP_NAME}.elf
-    )
+)
 
-if (DEFINED MCUBOOT_FLASH_PORT)
-    set(FLASH_PORT ${MCUBOOT_FLASH_PORT})
-else()
-    # Defaults to the first USB serial port
-    set(FLASH_PORT "/dev/ttyUSB0")
+if (DEFINED CONFIG_SECURE_BOOT_V2_ENABLED)
+    if (DEFINED CONFIG_SIGN_IMAGE)
+        if (DEFINED CONFIG_SIGN_IMAGE_EXTERNALLY)
+	    message(STATUS "Will sign the image externally")
+	    
+	    # Pad correctly to ensure correct signing applied
+            add_custom_command(TARGET ${APP_EXECUTABLE} POST_BUILD
+                COMMAND
+                ${esptool_path}
+                --chip ${MCUBOOT_TARGET} elf2image --pad-to-size 4KB --min-rev ${ESP_MIN_REVISION}
+                --flash_mode ${ESP_FLASH_MODE} --flash_freq ${ESP_FLASH_FREQ} --flash_size
+                ${CONFIG_ESP_FLASH_SIZE}
+                -o ${APP_NAME}_padded.bin ${APP_NAME}.elf
+            )
+
+            set(sign_script_path "${MCUBOOT_ROOT_DIR}/scripts/sign_image_locally_openssl.sh")
+
+            # Run the script to sign the image externally
+            add_custom_command(TARGET ${APP_EXECUTABLE} POST_BUILD
+                COMMAND
+                bash
+		        ${sign_script_path}
+		        ${APP_NAME}_padded.bin
+            )
+        endif()
+    endif()
 endif()
-
-if (NOT EXISTS "${FLASH_PORT}")
-    message(WARNING "Could not open ${FLASH_PORT}, serial port does not exist")
-endif()
-
-add_custom_target(flash DEPENDS ${APP_NAME}.bin)
-add_custom_command(TARGET flash
-    USES_TERMINAL
-    COMMAND
-    ${esptool_path}
-    -p ${FLASH_PORT} -b ${ESP_BAUD_RATE} --before default_reset --after no_reset
-    --chip ${MCUBOOT_TARGET} write_flash
-    --flash_mode ${ESP_FLASH_MODE} --flash_size ${CONFIG_ESP_FLASH_SIZE}
-    --flash_freq ${ESP_FLASH_FREQ} ${CONFIG_ESP_BOOTLOADER_OFFSET}
-    ${APP_NAME}.bin
-    )
