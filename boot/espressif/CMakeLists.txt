@@ -211,6 +211,36 @@ if(DEFINED CONFIG_ESP_SIGN_KEY_FILE)
             DEPENDS ${KEY_FILE}
         )
     list(APPEND crypto_srcs ${GENERATED_PUBKEY})
+elseif(DEFINED CONFIG_ESP_SIGN_KEY_FILE_EXTERNAL)
+    set(GENERATED_PUBKEY ${CMAKE_CURRENT_BINARY_DIR}/autogen-cryptera-pubkey.c)
+    if(DEFINED CONFIG_ESP_SIGN_EC256)
+        set(KEY_NAME "key1")    
+        set(KEY_FILE ${CMAKE_CURRENT_BINARY_DIR}/cryptera-${KEY_NAME}-pub.pem)
+	message("MCUBoot bootloader pubkey file from Cryptera: ${KEY_FILE}")
+        set(getpubkey_script_path "${MCUBOOT_ROOT_DIR}/scripts/get_pubkey_cryptera.sh")
+        # Run the script to get the public key from the remote server
+        add_custom_command(
+   	        OUTPUT ${KEY_FILE}
+            COMMAND
+            bash
+            ${getpubkey_script_path}
+            ${KEY_NAME}
+            ${KEY_FILE}
+        )
+    endif()
+    
+    # Convert the public key to a C file
+    add_custom_command(
+        OUTPUT ${GENERATED_PUBKEY}
+        COMMAND
+        ${imgtool_path}
+        getpub
+        -k
+        ${KEY_FILE}
+        > ${GENERATED_PUBKEY}
+        DEPENDS ${KEY_FILE}
+    )
+    list(APPEND crypto_srcs ${GENERATED_PUBKEY})
 endif()
 
 set(bootutil_srcs
